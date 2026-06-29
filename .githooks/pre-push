@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+echo "Running tests before push..."
+dotnet test VoltGuard.FieldLink.sln --no-restore --verbosity minimal
+echo "Tests passed. Push can continue."
