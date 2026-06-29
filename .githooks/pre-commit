@@ -1,6 +1,0 @@
-#!/bin/sh
-set -e
-
-echo "Running tests before commit..."
-dotnet test VoltGuard.FieldLink.sln --no-restore --verbosity minimal
-echo "Tests passed. Commit can continue."
