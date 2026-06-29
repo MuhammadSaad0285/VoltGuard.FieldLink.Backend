@@ -1,0 +1,12 @@
+﻿bin/
+obj/
+.vs/
+*.user
+*.suo
+*.rsuser
+TestResults/
+coverage/
+.coverage
+*.trx
+.config/
+.tools/

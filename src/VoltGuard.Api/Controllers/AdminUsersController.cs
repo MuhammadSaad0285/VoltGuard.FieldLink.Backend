@@ -1,0 +1,525 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Threading.Tasks;
+using VoltGuard.Domain.Entities;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using VoltGuard.Application.DTOs.Admin;
+
+namespace VoltGuard.Api.Controllers;
+
+[ApiController]
+[Authorize(Roles = "Admin")]
+[Route("api/admin/users")]
+public sealed class AdminUsersController : ControllerBase
+{
+    private static readonly string[] AllowedRoles = new[] { "Admin", "Engineer", "Viewer" };
+
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public AdminUsersController(UserManager<ApplicationUser> userManager)
+    {
+        _userManager = userManager;
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<PagedResult<AdminUserListItemDto>>> GetUsers(
+        [FromQuery] string? searchTerm = null,
+        [FromQuery] string? role = null,
+        [FromQuery] bool? isActive = null,
+        [FromQuery] int pageNumber = 1,
+        [FromQuery] int pageSize = 10)
+    {
+        pageNumber = Math.Max(1, pageNumber);
+        pageSize = pageSize < 1 ? 10 : Math.Min(pageSize, 100);
+
+        var users = _userManager.Users.ToList();
+
+        if (!string.IsNullOrWhiteSpace(searchTerm))
+        {
+            var cleanSearchTerm = searchTerm.Trim();
+
+            users = users
+                .Where(user =>
+                    ContainsIgnoreCase(user.FullName, cleanSearchTerm) ||
+                    ContainsIgnoreCase(user.UserName, cleanSearchTerm) ||
+                    ContainsIgnoreCase(user.Email, cleanSearchTerm))
+                .ToList();
+        }
+
+        if (!string.IsNullOrWhiteSpace(role))
+        {
+            var canonicalRole = GetCanonicalRole(role);
+
+            if (canonicalRole is null)
+            {
+                return BadRequest(new
+                {
+                    message = "Invalid role filter.",
+                    allowedRoles = AllowedRoles
+                });
+            }
+
+            var usersInRole = await _userManager.GetUsersInRoleAsync(canonicalRole);
+            var roleUserIds = usersInRole
+                .Select(user => user.Id)
+                .ToHashSet();
+
+            users = users
+                .Where(user => roleUserIds.Contains(user.Id))
+                .ToList();
+        }
+
+        if (isActive.HasValue)
+        {
+            users = users
+                .Where(user => user.IsActive == isActive.Value)
+                .ToList();
+        }
+
+        users = users
+            .OrderByDescending(user => user.CreatedAtUtc)
+            .ThenBy(user => user.Email)
+            .ToList();
+
+        var totalCount = users.Count;
+
+        var pageUsers = users
+            .Skip((pageNumber - 1) * pageSize)
+            .Take(pageSize)
+            .ToList();
+
+        var items = new List<AdminUserListItemDto>();
+
+        foreach (var user in pageUsers)
+        {
+            items.Add(await MapToListItemAsync(user));
+        }
+
+        return Ok(PagedResult<AdminUserListItemDto>.Create(items, totalCount, pageNumber, pageSize));
+    }
+
+    [HttpGet("{id}")]
+    public async Task<ActionResult<AdminUserDetailsDto>> GetUser(string id)
+    {
+        var lookup = await TryGetUserByIdAsync(id);
+
+        if (lookup.Error is not null)
+        {
+            return lookup.Error;
+        }
+
+        var user = lookup.User;
+
+        if (user is null)
+        {
+            return NotFound(new { message = "User not found." });
+        }
+
+        return Ok(await MapToDetailsAsync(user));
+    }
+
+    [HttpPost]
+    public async Task<ActionResult<AdminUserDetailsDto>> Create(CreateAdminUserRequest request)
+    {
+        var validation = ValidateCreateRequest(request);
+
+        if (validation is not null)
+        {
+            return validation;
+        }
+
+        var fullName = request.FullName.Trim();
+        var email = request.Email.Trim();
+
+        var roleValidation = NormalizeAndValidateRoles(request.Roles);
+
+        if (roleValidation.Error is not null)
+        {
+            return roleValidation.Error;
+        }
+
+        var existingUser = await _userManager.FindByEmailAsync(email);
+
+        if (existingUser is not null)
+        {
+            return Conflict(new { message = "A user with this email already exists." });
+        }
+
+        var user = new ApplicationUser
+        {
+            UserName = email,
+            Email = email,
+            EmailConfirmed = true,
+            FullName = fullName,
+            IsActive = request.IsActive,
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = null
+        };
+
+        var createResult = await _userManager.CreateAsync(user, request.Password);
+
+        if (!createResult.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("User could not be created.", createResult));
+        }
+
+        var addRolesResult = await _userManager.AddToRolesAsync(user, roleValidation.Roles);
+
+        if (!addRolesResult.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("User was created, but roles could not be assigned.", addRolesResult));
+        }
+
+        var dto = await MapToDetailsAsync(user);
+
+        return CreatedAtAction(nameof(GetUser), new { id = user.Id.ToString() }, dto);
+    }
+
+    [HttpPut("{id}")]
+    public async Task<IActionResult> Update(string id, UpdateAdminUserRequest request)
+    {
+        var validation = ValidateUpdateRequest(request);
+
+        if (validation is not null)
+        {
+            return validation;
+        }
+
+        var lookup = await TryGetUserByIdAsync(id);
+
+        if (lookup.Error is not null)
+        {
+            return lookup.Error;
+        }
+
+        var user = lookup.User;
+
+        if (user is null)
+        {
+            return NotFound(new { message = "User not found." });
+        }
+
+        var fullName = request.FullName.Trim();
+        var email = request.Email.Trim();
+
+        var roleValidation = NormalizeAndValidateRoles(request.Roles);
+
+        if (roleValidation.Error is not null)
+        {
+            return roleValidation.Error;
+        }
+
+        var existingUser = await _userManager.FindByEmailAsync(email);
+
+        if (existingUser is not null &&
+            !string.Equals(existingUser.Id.ToString(), user.Id.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return Conflict(new { message = "Another user already uses this email." });
+        }
+
+        user.FullName = fullName;
+        user.Email = email;
+        user.UserName = email;
+        user.NormalizedEmail = _userManager.NormalizeEmail(email);
+        user.NormalizedUserName = _userManager.NormalizeName(email);
+        user.IsActive = request.IsActive;
+        user.UpdatedAtUtc = DateTime.UtcNow;
+
+        var updateResult = await _userManager.UpdateAsync(user);
+
+        if (!updateResult.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("User could not be updated.", updateResult));
+        }
+
+        var currentRoles = await _userManager.GetRolesAsync(user);
+
+        if (currentRoles.Count > 0)
+        {
+            var removeRolesResult = await _userManager.RemoveFromRolesAsync(user, currentRoles);
+
+            if (!removeRolesResult.Succeeded)
+            {
+                return BadRequest(ToIdentityErrorResponse("Existing user roles could not be removed.", removeRolesResult));
+            }
+        }
+
+        var addRolesResult = await _userManager.AddToRolesAsync(user, roleValidation.Roles);
+
+        if (!addRolesResult.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("New user roles could not be assigned.", addRolesResult));
+        }
+
+        return NoContent();
+    }
+
+    [HttpPatch("{id}/activate")]
+    public async Task<IActionResult> Activate(string id)
+    {
+        var lookup = await TryGetUserByIdAsync(id);
+
+        if (lookup.Error is not null)
+        {
+            return lookup.Error;
+        }
+
+        var user = lookup.User;
+
+        if (user is null)
+        {
+            return NotFound(new { message = "User not found." });
+        }
+
+        user.IsActive = true;
+        user.UpdatedAtUtc = DateTime.UtcNow;
+
+        var result = await _userManager.UpdateAsync(user);
+
+        if (!result.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("User could not be activated.", result));
+        }
+
+        return NoContent();
+    }
+
+    [HttpPatch("{id}/deactivate")]
+    public async Task<IActionResult> Deactivate(string id)
+    {
+        var lookup = await TryGetUserByIdAsync(id);
+
+        if (lookup.Error is not null)
+        {
+            return lookup.Error;
+        }
+
+        var user = lookup.User;
+
+        if (user is null)
+        {
+            return NotFound(new { message = "User not found." });
+        }
+
+        user.IsActive = false;
+        user.UpdatedAtUtc = DateTime.UtcNow;
+
+        var result = await _userManager.UpdateAsync(user);
+
+        if (!result.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("User could not be deactivated.", result));
+        }
+
+        return NoContent();
+    }
+
+    [HttpPost("{id}/reset-password")]
+    public async Task<IActionResult> ResetPassword(string id, ResetUserPasswordRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.NewPassword))
+        {
+            return BadRequest(new { message = "New password is required." });
+        }
+
+        var lookup = await TryGetUserByIdAsync(id);
+
+        if (lookup.Error is not null)
+        {
+            return lookup.Error;
+        }
+
+        var user = lookup.User;
+
+        if (user is null)
+        {
+            return NotFound(new { message = "User not found." });
+        }
+
+        var token = await _userManager.GeneratePasswordResetTokenAsync(user);
+        var result = await _userManager.ResetPasswordAsync(user, token, request.NewPassword);
+
+        if (!result.Succeeded)
+        {
+            return BadRequest(ToIdentityErrorResponse("Password could not be reset.", result));
+        }
+
+        user.UpdatedAtUtc = DateTime.UtcNow;
+        await _userManager.UpdateAsync(user);
+
+        return NoContent();
+    }
+
+    private async Task<(ApplicationUser? User, ActionResult? Error)> TryGetUserByIdAsync(string id)
+    {
+        if (!Guid.TryParse(id, out var userId))
+        {
+            return (null, new BadRequestObjectResult(new { message = "User id must be a valid GUID." }));
+        }
+
+        return (await _userManager.FindByIdAsync(userId.ToString()), null);
+    }
+
+    private async Task<AdminUserListItemDto> MapToListItemAsync(ApplicationUser user)
+    {
+        var roles = await _userManager.GetRolesAsync(user);
+
+        return new AdminUserListItemDto
+        {
+            Id = user.Id.ToString(),
+            FullName = user.FullName,
+            UserName = user.UserName,
+            Email = user.Email ?? "",
+            Roles = roles.ToArray(),
+            IsActive = user.IsActive,
+            CreatedAtUtc = user.CreatedAtUtc,
+            LastLoginAtUtc = user.LastLoginAtUtc
+        };
+    }
+
+    private async Task<AdminUserDetailsDto> MapToDetailsAsync(ApplicationUser user)
+    {
+        var roles = await _userManager.GetRolesAsync(user);
+
+        return new AdminUserDetailsDto
+        {
+            Id = user.Id.ToString(),
+            FullName = user.FullName,
+            UserName = user.UserName,
+            Email = user.Email ?? "",
+            Roles = roles.ToArray(),
+            IsActive = user.IsActive,
+            CreatedAtUtc = user.CreatedAtUtc,
+            LastLoginAtUtc = user.LastLoginAtUtc,
+            UpdatedAtUtc = user.UpdatedAtUtc
+        };
+    }
+
+    private static ActionResult? ValidateCreateRequest(CreateAdminUserRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.FullName))
+        {
+            return new BadRequestObjectResult(new { message = "Full name is required." });
+        }
+
+        if (!IsValidEmail(request.Email))
+        {
+            return new BadRequestObjectResult(new { message = "A valid email is required." });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+        {
+            return new BadRequestObjectResult(new { message = "Password is required." });
+        }
+
+        return null;
+    }
+
+    private static ActionResult? ValidateUpdateRequest(UpdateAdminUserRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.FullName))
+        {
+            return new BadRequestObjectResult(new { message = "Full name is required." });
+        }
+
+        if (!IsValidEmail(request.Email))
+        {
+            return new BadRequestObjectResult(new { message = "A valid email is required." });
+        }
+
+        return null;
+    }
+
+    private static (string[] Roles, ActionResult? Error) NormalizeAndValidateRoles(string[]? requestedRoles)
+    {
+        if (requestedRoles is null || requestedRoles.Length == 0)
+        {
+            return (Array.Empty<string>(), new BadRequestObjectResult(new { message = "At least one role is required.", allowedRoles = AllowedRoles }));
+        }
+
+        var roles = new List<string>();
+        var invalidRoles = new List<string>();
+
+        foreach (var role in requestedRoles)
+        {
+            if (string.IsNullOrWhiteSpace(role))
+            {
+                continue;
+            }
+
+            var cleanRole = role.Trim();
+            var canonicalRole = GetCanonicalRole(cleanRole);
+
+            if (canonicalRole is null)
+            {
+                invalidRoles.Add(cleanRole);
+                continue;
+            }
+
+            if (!roles.Contains(canonicalRole, StringComparer.OrdinalIgnoreCase))
+            {
+                roles.Add(canonicalRole);
+            }
+        }
+
+        if (roles.Count == 0)
+        {
+            return (Array.Empty<string>(), new BadRequestObjectResult(new { message = "At least one role is required.", allowedRoles = AllowedRoles }));
+        }
+
+        if (invalidRoles.Count > 0)
+        {
+            return (Array.Empty<string>(), new BadRequestObjectResult(new
+            {
+                message = "One or more roles are invalid.",
+                invalidRoles,
+                allowedRoles = AllowedRoles
+            }));
+        }
+
+        return (roles.ToArray(), null);
+    }
+
+    private static string? GetCanonicalRole(string? role)
+    {
+        if (string.IsNullOrWhiteSpace(role))
+        {
+            return null;
+        }
+
+        return AllowedRoles.FirstOrDefault(allowedRole =>
+            allowedRole.Equals(role.Trim(), StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool ContainsIgnoreCase(string? value, string searchTerm)
+    {
+        return !string.IsNullOrWhiteSpace(value) &&
+               value.Contains(searchTerm, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsValidEmail(string? email)
+    {
+        return !string.IsNullOrWhiteSpace(email) &&
+               new EmailAddressAttribute().IsValid(email.Trim());
+    }
+
+    private static object ToIdentityErrorResponse(string message, IdentityResult result)
+    {
+        return new
+        {
+            message,
+            errors = result.Errors
+                .Select(error => new
+                {
+                    error.Code,
+                    error.Description
+                })
+                .ToArray()
+        };
+    }
+}
+
